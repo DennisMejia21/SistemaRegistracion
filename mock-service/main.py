@@ -118,3 +118,53 @@ def registrar(datos: Registro):
         "usuario_id": usuario_id,
         "proyecto_id": datos.proyecto_id
     }
+
+@app.get("/usuarios")
+def listar_usuarios():
+
+    conexion = conectar_db()
+    cursor = conexion.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT
+            u.id,
+            u.nombre,
+            u.apellido,
+            u.email,
+            p.id AS proyecto_id,
+            p.nombre AS proyecto
+        FROM usuarios u
+        LEFT JOIN usuario_proyecto up
+            ON u.id = up.usuario_id
+        LEFT JOIN proyectos p
+            ON p.id = up.proyecto_id
+        ORDER BY u.id
+    """)
+
+    resultados = cursor.fetchall()
+
+    cursor.close()
+    conexion.close()
+
+    usuarios = {}
+
+    for fila in resultados:
+
+        usuario_id = fila["id"]
+
+        if usuario_id not in usuarios:
+            usuarios[usuario_id] = {
+                "id": fila["id"],
+                "nombre": fila["nombre"],
+                "apellido": fila["apellido"],
+                "email": fila["email"],
+                "proyectos": []
+            }
+
+        if fila["proyecto_id"] is not None:
+            usuarios[usuario_id]["proyectos"].append({
+                "id": fila["proyecto_id"],
+                "nombre": fila["proyecto"]
+            })
+
+    return list(usuarios.values())
