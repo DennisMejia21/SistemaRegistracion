@@ -5,25 +5,33 @@ services:
     container_name: registracion_mock
     ports:
       - "8000:8000"
+
     environment:
       DB_HOST: mysql
       DB_PORT: 3306
       DB_NAME: registracion
       DB_USER: registracion_user
       DB_PASSWORD: registracion_pass
+
+      # Token que debe utilizar el servicio de Login
+      TOKEN_LOGIN_APP: jsbhir8hlP4ZR_A8WKCiPk5Mn0iUTEhoK75xxvo3nKo
+
     depends_on:
       - mysql
 
   mysql:
     image: mysql:8.0
     container_name: registracion_mysql
+
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: registracion
       MYSQL_USER: registracion_user
       MYSQL_PASSWORD: registracion_pass
+
     ports:
       - "3307:3306"
+
     volumes:
       - mysql_data:/var/lib/mysql
       - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -31,11 +39,14 @@ services:
   phpmyadmin:
     image: phpmyadmin/phpmyadmin
     container_name: registracion_phpmyadmin
+
     ports:
       - "8081:80"
+
     environment:
       PMA_HOST: mysql
       PMA_PORT: 3306
+
     depends_on:
       - mysql
 

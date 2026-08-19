@@ -1,6 +1,7 @@
 import os
 import mysql.connector
 
+from fastapi import FastAPI, Header, HTTPException
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -158,6 +159,80 @@ def listar_usuarios():
                 "nombre": fila["nombre"],
                 "apellido": fila["apellido"],
                 "email": fila["email"],
+                "proyectos": []
+            }
+
+        if fila["proyecto_id"] is not None:
+            usuarios[usuario_id]["proyectos"].append({
+                "id": fila["proyecto_id"],
+                "nombre": fila["proyecto"]
+            })
+
+    return list(usuarios.values())
+
+@app.get("/usuarios")
+def listar_usuarios(authorization: str | None = Header(default=None)):
+
+    token_correcto = os.getenv("TOKEN_LOGIN_APP")
+
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Falta el header Authorization"
+        )
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="El Authorization debe utilizar Bearer"
+        )
+
+    token_recibido = authorization.replace("Bearer ", "", 1)
+
+    if token_recibido != token_correcto:
+        raise HTTPException(
+            status_code=401,
+            detail="Token inválido"
+        )
+
+    conexion = conectar_db()
+    cursor = conexion.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT
+            u.id,
+            u.nombre,
+            u.apellido,
+            u.email,
+            u.password,
+            p.id AS proyecto_id,
+            p.nombre AS proyecto
+        FROM usuarios u
+        LEFT JOIN usuario_proyecto up
+            ON u.id = up.usuario_id
+        LEFT JOIN proyectos p
+            ON p.id = up.proyecto_id
+        ORDER BY u.id
+    """)
+
+    resultados = cursor.fetchall()
+
+    cursor.close()
+    conexion.close()
+
+    usuarios = {}
+
+    for fila in resultados:
+
+        usuario_id = fila["id"]
+
+        if usuario_id not in usuarios:
+            usuarios[usuario_id] = {
+                "id": fila["id"],
+                "nombre": fila["nombre"],
+                "apellido": fila["apellido"],
+                "email": fila["email"],
+                "password": fila["password"],
                 "proyectos": []
             }
 
