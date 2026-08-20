@@ -20,16 +20,19 @@ contraseñas: le preguntan a este servicio.
 * Asociar usuarios a proyectos.
 * Evitar registros duplicados en un mismo proyecto.
 * Validar credenciales (login).
+* Resetear la contraseña de alguien que la perdió.
 * Consultar usuarios y los proyectos en los que están registrados.
 
 ### Endpoints
 
 ```text
-GET  /             estado del servicio
-POST /login        valida credenciales -> usuario + sus proyectos
-POST /registrar    alta (o vinculación a otro proyecto)
-GET  /usuarios     padrón completo          [requiere token]
-GET  /proyectos    proyectos disponibles
+GET  /                 estado del servicio
+POST /login            valida credenciales -> usuario + sus proyectos
+POST /registrar        alta (o vinculación a otro proyecto)
+GET  /usuarios         padrón completo               [token de app]
+GET  /proyectos        proyectos disponibles
+POST /password/reset   emite un token de reset       [token de la cátedra]
+POST /password         canjea el token por una contraseña nueva
 ```
 
 #### `POST /login`
@@ -93,12 +96,57 @@ para validar credenciales está `POST /login`.
 Se guardan hasheadas con **bcrypt** (cost 12). Entran en la columna `password`
 (`VARCHAR(255)`) sin cambiar el esquema: un hash bcrypt son 60 caracteres.
 
-bcrypt no mira más allá de los **72 bytes** de la contraseña, así que contraseñas más
-largas se rechazan con 422. Ojo con confundir ese límite con el `VARCHAR(255)`: los 255
-son para el hash, no para la contraseña.
+Tiene que tener **al menos 8 caracteres**, y bcrypt no mira más allá de los **72
+bytes**, así que las más largas se rechazan con 422. Ojo con confundir ese límite con el
+`VARCHAR(255)`: los 255 son para el hash, no para la contraseña.
 
 Los emails se guardan y se buscan en minúsculas y sin espacios, para que el login no
 dependa de cómo los escriban.
+
+### Reset de contraseña
+
+No hay "olvidé mi contraseña" automático: el servicio no manda mails, así que no tiene
+forma de comprobar que quien pide el reset sea la persona. Eso lo comprueba alguien de
+la cátedra por fuera del sistema, y recién entonces emite un token.
+
+Son dos pasos. Primero la cátedra pide el token, con **su** `ADMIN_TOKEN`:
+
+```bash
+curl -X POST localhost:8000/password/reset \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"email":"ortiz@gmail.com"}'
+```
+
+```json
+{ "token": "XyK5xoKB0yPebLrXKD_e8hrVBsXrR14Qoe3QRo2vpqM",
+  "email": "ortiz@gmail.com", "vence_en": "2026-08-20T03:09:12", "minutos": 30 }
+```
+
+Ese token **se ve una sola vez**: en la base queda solo su hash. Hay que hacérselo
+llegar a la persona por donde sea (mensaje, en mano). Después lo canjea ella, eligiendo
+su contraseña, sin que nadie más la conozca:
+
+```bash
+curl -X POST localhost:8000/password -H 'Content-Type: application/json' \
+  -d '{"token":"XyK5...","password":"LaQueEllaElija"}'
+```
+
+Detalles que importan:
+
+* **`ADMIN_TOKEN` no es el `API_TOKEN`.** El `API_TOKEN` lo tiene cada front de la
+  materia; si sirviera para esto, cualquier proyecto podría cambiarle la contraseña a
+  cualquiera. Si los dos valores son iguales, el servicio se niega a emitir resets.
+* **Un solo uso y 30 minutos** (`MINUTOS_DE_RESET`). Pedir uno nuevo invalida el
+  anterior.
+* **Mismo error para todo**: token inventado, vencido o ya usado responden 400 con
+  `{"detail": "El token no sirve o ya vencio"}`. No hay nada que averiguar probando.
+* **Las sesiones abiertas no se cortan.** Las emite el front (cookie firmada, 24 h) y
+  este servicio no tiene con qué revocarlas. Si el reset fue porque alguien se metió en
+  la cuenta, además hay que esperar a que venza esa cookie o cambiar el
+  `SESION_SECRETO` del front, que cierra todas.
+* La tabla `resets_password` la crea `database/init.sql`, y el servicio la crea también
+  al arrancar si no existe: `init.sql` solo corre con el volumen de mysql vacío, y las
+  bases que ya venían andando no la tendrían.
 
 ### Ejecutar
 
@@ -109,7 +157,8 @@ el repositorio**. Lo que se versiona es `.env.example`, con valores de mentira:
 cp .env.example .env
 ```
 
-Editalo (al menos `DB_PASSWORD`, `MYSQL_ROOT_PASSWORD` y `API_TOKEN`) y levantá:
+Editalo (al menos `DB_PASSWORD`, `MYSQL_ROOT_PASSWORD`, `API_TOKEN` y `ADMIN_TOKEN`) y
+levantá:
 
 ```bash
 docker compose up --build
@@ -124,6 +173,8 @@ propósito: así nadie levanta el padrón con la contraseña del ejemplo.
 | `DB_PASSWORD` | contraseña de ese usuario, la misma de los dos lados | — (obligatoria) |
 | `MYSQL_ROOT_PASSWORD` | root de mysql, para phpMyAdmin y los dumps | — (obligatoria) |
 | `API_TOKEN` | token de `GET /usuarios` | — (obligatoria) |
+| `ADMIN_TOKEN` | token de la cátedra, para emitir resets | — (obligatoria) |
+| `MINUTOS_DE_RESET` | cuánto vive un token de reset | `30` |
 | `PUERTO_API`, `PUERTO_MYSQL`, `PUERTO_PHPMYADMIN` | puertos **de la máquina** | `8000`, `3307`, `8081` |
 | `BIND_HOST` | interfaz donde se publican | `127.0.0.1` (solo esta máquina) |
 

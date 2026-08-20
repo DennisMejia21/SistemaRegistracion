@@ -1,6 +1,7 @@
+import hashlib
 import os
 import secrets
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 import bcrypt
 import mysql.connector
@@ -9,7 +10,19 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 
-app = FastAPI(title="Servicio de Registración")
+@asynccontextmanager
+async def preparar(app: FastAPI):
+    """Crea la tabla de resets si falta, antes de atender el primer pedido.
+
+    `database/init.sql` solo corre cuando el volumen de mysql esta vacio, asi
+    que en una base que ya venia andando esa tabla no existiria. Aca se crea si
+    hace falta y no pasa nada si ya esta.
+    """
+    asegurar_tabla_resets()
+    yield
+
+
+app = FastAPI(title="Servicio de Registración", lifespan=preparar)
 
 
 # Token de las aplicaciones que leen el padrón (por ahora, el front de login).
@@ -17,10 +30,24 @@ app = FastAPI(title="Servicio de Registración")
 # cualquiera que llegue al puerto se lleva todos los emails.
 API_TOKEN = os.getenv("API_TOKEN", "")
 
+# Token de la catedra, para emitir un reset de contraseña. Es OTRO token a
+# proposito: el de arriba lo tiene cada front, y si sirviera para esto
+# cualquier proyecto de la materia podria cambiarle la contraseña a cualquiera.
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+# Cuanto vive un token de reset. Corto porque viaja por fuera del sistema
+# (se lo pasan a la persona por donde puedan) y no hay forma de saber por
+# cuantas manos anduvo.
+MINUTOS_DE_RESET = int(os.getenv("MINUTOS_DE_RESET", "30"))
+
 # bcrypt no mira mas alla de los 72 bytes de la contraseña. Es un limite del
 # algoritmo, no de la columna: `password` es VARCHAR(255) porque ahi entra el
 # hash (60 caracteres), no porque la contraseña pueda ser tan larga.
 PASSWORD_MAX_BYTES = 72
+
+# El front ya pide 8; que el padron acepte menos no tendria sentido, porque el
+# alta y el reset se le pueden pegar directo sin pasar por ningun front.
+PASSWORD_MIN_LARGO = 8
 
 
 class Registro(BaseModel):
@@ -33,6 +60,15 @@ class Registro(BaseModel):
 
 class Credenciales(BaseModel):
     email: str
+    password: str
+
+
+class PedidoDeReset(BaseModel):
+    email: str
+
+
+class PasswordNueva(BaseModel):
+    token: str
     password: str
 
 
@@ -87,7 +123,41 @@ def verificar(password: str, guardado: str) -> bool:
         return False
 
 
+def asegurar_tabla_resets() -> None:
+    """Tabla de los tokens de reset. Ver `database/init.sql`, que la crea igual.
+
+    Del token guardamos el hash, no el token: si alguien se lleva un dump de la
+    base, con los hashes no puede cambiarle la contraseña a nadie. Es SHA-256 y
+    no bcrypt porque el token lo generamos nosotros con 256 bits de azar: no hay
+    nada que adivinar a fuerza bruta, que es contra lo que sirve bcrypt.
+    """
+    with base_de_datos() as cursor:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS resets_password (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                usuario_id INT NOT NULL,
+                token_hash CHAR(64) NOT NULL UNIQUE,
+                vence_en DATETIME NOT NULL,
+                usado_en DATETIME NULL,
+
+                FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
+            )
+            """
+        )
+
+
+def hashear_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 def exigir_password_valida(password: str) -> None:
+    if len(password) < PASSWORD_MIN_LARGO:
+        raise HTTPException(
+            status_code=422,
+            detail=f"La contraseña necesita al menos {PASSWORD_MIN_LARGO} caracteres"
+        )
+
     if len(password.encode()) > PASSWORD_MAX_BYTES:
         raise HTTPException(
             status_code=422,
@@ -101,6 +171,23 @@ def exigir_token(authorization: str | None) -> None:
         raise HTTPException(status_code=500, detail="API_TOKEN no esta configurado")
 
     if not authorization or not secrets.compare_digest(authorization, f"Bearer {API_TOKEN}"):
+        raise HTTPException(status_code=401, detail="Token invalido")
+
+
+def exigir_admin(authorization: str | None) -> None:
+    """El token de la catedra, no el de las aplicaciones."""
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=500, detail="ADMIN_TOKEN no esta configurado")
+
+    if ADMIN_TOKEN == API_TOKEN:
+        # Si fueran el mismo, el token que tiene cada front alcanzaria para
+        # resetear contraseñas ajenas. Mejor no arrancar que dejarlo pasar.
+        raise HTTPException(
+            status_code=500,
+            detail="ADMIN_TOKEN no puede ser igual a API_TOKEN"
+        )
+
+    if not authorization or not secrets.compare_digest(authorization, f"Bearer {ADMIN_TOKEN}"):
         raise HTTPException(status_code=401, detail="Token invalido")
 
 
@@ -306,3 +393,120 @@ def listar_proyectos():
     with base_de_datos() as cursor:
         cursor.execute("SELECT id, nombre FROM proyectos ORDER BY id")
         return cursor.fetchall()
+
+
+@app.post("/password/reset")
+def emitir_reset(datos: PedidoDeReset, authorization: str | None = Header(default=None)):
+    """Emite un token de un solo uso para que alguien elija contraseña nueva.
+
+    Pide `Authorization: Bearer <ADMIN_TOKEN>`, que es el de la catedra y NO el
+    que tienen los fronts: quien pide un reset esta diciendo "esta persona es
+    quien dice ser", y eso lo comprueba alguien de la materia por fuera del
+    sistema (la ve, la conoce, le pregunta algo). El servicio no tiene con que
+    comprobarlo: no manda mails.
+
+    El token se devuelve UNA vez y despues no se puede volver a ver, porque en
+    la base queda solo su hash. Hay que hacerselo llegar a la persona por donde
+    sea, y por eso vive poco.
+    """
+    exigir_admin(authorization)
+
+    email = normalizar_email(datos.email)
+
+    with base_de_datos() as cursor:
+        usuario = buscar_por_email(cursor, email)
+
+        if usuario is None:
+            # Aca si se puede decir que no existe: del otro lado hay alguien de
+            # la catedra, no cualquiera. Que se entere de que se equivoco de
+            # email es mejor que emitir un token para nadie.
+            raise HTTPException(status_code=404, detail="No hay nadie con ese email")
+
+        # Un pedido nuevo invalida los anteriores: si no, cada uno que se emitio
+        # y quedo dando vueltas sigue sirviendo hasta que vence.
+        cursor.execute(
+            """
+            UPDATE resets_password
+            SET usado_en = NOW()
+            WHERE usuario_id = %s
+            AND usado_en IS NULL
+            """,
+            (usuario["id"],)
+        )
+
+        token = secrets.token_urlsafe(32)
+
+        cursor.execute(
+            """
+            INSERT INTO resets_password
+            (usuario_id, token_hash, vence_en)
+            VALUES (%s, %s, DATE_ADD(NOW(), INTERVAL %s MINUTE))
+            """,
+            (
+                usuario["id"],
+                hashear_token(token),
+                MINUTOS_DE_RESET
+            )
+        )
+
+        cursor.execute(
+            "SELECT vence_en FROM resets_password WHERE id = %s",
+            (cursor.lastrowid,)
+        )
+
+        return {
+            "token": token,
+            "email": usuario["email"],
+            "vence_en": cursor.fetchone()["vence_en"],
+            "minutos": MINUTOS_DE_RESET
+        }
+
+
+@app.post("/password")
+def cambiar_password(datos: PasswordNueva):
+    """Canjea el token por una contraseña nueva. La elige la persona.
+
+    Sin token: el token ES la credencial. Por eso el mismo error para uno
+    inventado, uno vencido y uno ya usado: no hay nada que averiguar probando.
+
+    Las sesiones que el front haya abierto antes siguen vivas: las emite el
+    front, no este servicio, y aca no hay nada que revocar.
+    """
+    exigir_password_valida(datos.password)
+
+    with base_de_datos() as cursor:
+        cursor.execute(
+            """
+            SELECT id, usuario_id
+            FROM resets_password
+            WHERE token_hash = %s
+            AND usado_en IS NULL
+            AND vence_en > NOW()
+            """,
+            (hashear_token(datos.token),)
+        )
+
+        reset = cursor.fetchone()
+
+        if reset is None:
+            raise HTTPException(status_code=400, detail="El token no sirve o ya vencio")
+
+        cursor.execute(
+            "UPDATE usuarios SET password = %s WHERE id = %s",
+            (
+                hashear(datos.password),
+                reset["usuario_id"]
+            )
+        )
+
+        # Se marca usado en la misma transaccion que el cambio: o pasan las dos
+        # cosas o no pasa ninguna, asi el token no puede quedar servido dos veces.
+        cursor.execute(
+            "UPDATE resets_password SET usado_en = NOW() WHERE id = %s",
+            (reset["id"],)
+        )
+
+        return {
+            "ok": True,
+            "mensaje": "Contraseña actualizada"
+        }

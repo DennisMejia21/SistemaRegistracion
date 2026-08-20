@@ -23,6 +23,11 @@ services:
       # (GET /usuarios), en `Authorization: Bearer`.
       API_TOKEN: ${API_TOKEN:?falta API_TOKEN, copia .env.example a .env}
 
+      # Token de la catedra, para emitir resets de contraseña. Tiene que ser
+      # distinto del de arriba: ese lo tiene cada front.
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?falta ADMIN_TOKEN, copia .env.example a .env}
+      MINUTOS_DE_RESET: ${MINUTOS_DE_RESET:-30}
+
     depends_on:
       mysql:
         condition: service_healthy
