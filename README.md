@@ -29,10 +29,13 @@ contraseñas: le preguntan a este servicio.
 GET  /                 estado del servicio
 POST /login            valida credenciales -> usuario + sus proyectos
 POST /registrar        alta (o vinculación a otro proyecto)
-GET  /usuarios         padrón completo               [token de app]
+GET  /usuarios         los usuarios de quien pregunta  [token de app]
 GET  /proyectos        proyectos disponibles
 POST /password/reset   emite un token de reset       [token de la cátedra]
 POST /password         canjea el token por una contraseña nueva
+POST /aplicaciones     da de alta una app y su token   [token de la cátedra]
+GET  /aplicaciones     qué apps hay y qué ve cada una  [token de la cátedra]
+DELETE /aplicaciones/{id}   revoca el token de una app [token de la cátedra]
 ```
 
 #### `POST /login`
@@ -82,14 +85,62 @@ Si ya estaba en ese mismo proyecto responde 200 con `{"ok": false}`.
 
 #### `GET /usuarios`
 
-Devuelve el padrón completo, así que pide token:
+Devuelve **los usuarios que le corresponden a la aplicación que pregunta**, según su
+token:
 
 ```bash
-curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8000/usuarios
+curl -H "Authorization: Bearer $TOKEN_DE_LA_APP" http://localhost:8000/usuarios
 ```
 
-Sin el header, o con un token que no es, responde 401. **Nunca devuelve `password`**:
-para validar credenciales está `POST /login`.
+Si el token es el de un proyecto, salen solo los inscriptos en **ese** proyecto, y de
+cada uno solo ese proyecto: que alguien esté además en Carpooling no es asunto de
+Alquiler de Quintas. El único que ve el padrón entero es el login central, que lo
+necesita para ofrecer "elegí tu proyecto" antes de saber a cuál va la persona.
+
+Sin el header, con un token que no es, o con uno revocado, responde 401. **Nunca
+devuelve `password`**: para validar credenciales está `POST /login`.
+
+### Un token por proyecto
+
+Cada aplicación que le pega al padrón tiene el suyo, en la tabla `aplicaciones`. Antes
+había uno solo para todos, y con él cualquier front se llevaba el padrón entero,
+incluida la gente de los otros proyectos. Ahora el padrón sabe **quién** pregunta.
+
+Las da de alta la cátedra, con su `ADMIN_TOKEN`:
+
+```bash
+curl -X POST localhost:8000/aplicaciones \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"nombre":"Carpooling","proyecto_id":1}'
+```
+
+```json
+{ "id": 2, "nombre": "Carpooling", "proyecto_id": 1,
+  "token": "d-Bz-m38gy7YhvWs4BP-MvwDfzmQrWMOS5tQwnyyBkM",
+  "aviso": "Guardalo ahora: no se vuelve a mostrar" }
+```
+
+Ese token es el que va en el `.env` del front de ese proyecto. **Se ve una sola vez**:
+en la base queda solo su hash, así que un dump no le sirve a nadie para entrar. Si se
+pierde, se revoca esa y se crea otra.
+
+Para ver qué hay y cortar una:
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8000/aplicaciones
+curl -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8000/aplicaciones/2
+```
+
+Revocar no borra la fila: queda el registro de que existió y cuándo se cortó, y no toca
+a las demás.
+
+**El login central es un caso aparte.** Su token es `API_TOKEN`, del `.env`, y el
+servicio registra esa aplicación solo al arrancar (`proyecto_id` NULL, o sea: ve todo).
+Cambiar la variable y reiniciar cambia su token; por eso esa fila no se revoca desde la
+API, se maneja desde el `.env`.
+
+`ADMIN_TOKEN` no está en esta tabla y no es el token de ninguna aplicación: si lo fuera,
+cualquier proyecto podría emitirse tokens nuevos o resetear contraseñas ajenas.
 
 ### Contraseñas
 
@@ -172,8 +223,8 @@ propósito: así nadie levanta el padrón con la contraseña del ejemplo.
 | `DB_NAME`, `DB_USER` | base y usuario que crea mysql | `registracion`, `registracion_user` |
 | `DB_PASSWORD` | contraseña de ese usuario, la misma de los dos lados | — (obligatoria) |
 | `MYSQL_ROOT_PASSWORD` | root de mysql, para phpMyAdmin y los dumps | — (obligatoria) |
-| `API_TOKEN` | token de `GET /usuarios` | — (obligatoria) |
-| `ADMIN_TOKEN` | token de la cátedra, para emitir resets | — (obligatoria) |
+| `API_TOKEN` | token del **login central**, la app que ve todo el padrón | — (obligatoria) |
+| `ADMIN_TOKEN` | token de la cátedra: resets y alta de aplicaciones | — (obligatoria) |
 | `MINUTOS_DE_RESET` | cuánto vive un token de reset | `30` |
 | `PUERTO_API`, `PUERTO_MYSQL`, `PUERTO_PHPMYADMIN` | puertos **de la máquina** | `8000`, `3307`, `8081` |
 | `BIND_HOST` | interfaz donde se publican | `127.0.0.1` (solo esta máquina) |
@@ -201,22 +252,27 @@ http://localhost:8000/docs
 
 phpMyAdmin queda en `http://localhost:8081` (o el `PUERTO_PHPMYADMIN` que hayas puesto).
 
-### El front que lo consume
+### Los fronts que lo consumen
 
-[login-pp2](https://github.com/Ficuu/login-pp2) es el front de login y alta. No tiene
-base de datos ni guarda contraseñas: hace `POST /login` acá y, con los proyectos que
-vuelven en esa respuesta, decide si la persona no entra (cero proyectos), entra derecho
-(uno) o elige en un selector (varios).
+[login-pp2](https://github.com/Ficuu/login-pp2) es el login central de la materia. No
+tiene base de datos ni guarda contraseñas: hace `POST /login` acá y, con los proyectos
+que vuelven en esa respuesta, decide si la persona no entra (cero proyectos), entra
+derecho (uno) o elige en un selector (varios). Usa el token de `API_TOKEN`, que es el
+único que ve el padrón entero.
 
 Para probar los dos juntos, en el repo del front:
 
 ```bash
-PADRON_URL=http://localhost:8000   # el PUERTO_API de acá
-PADRON_TOKEN=...                   # el mismo API_TOKEN de acá
-SESION_SECRETO=...                 # 32+ caracteres, propio del front
+cp .env.example .env    # PADRON_TOKEN = el API_TOKEN de acá, y un SESION_SECRETO
+docker compose up -d --build
 ```
 
-y levantarlo en otro puerto, `npm run dev -- -p 3001`.
+Queda en `http://localhost:3001`. Levantá este repo primero: el compose del front se
+cuelga de la red que crea el de acá.
+
+El front de **cada proyecto** (Carpooling, Alquiler de Quintas, Sistema de Reservas) no
+usa ese token: cada uno tiene el suyo, dado de alta con `POST /aplicaciones`, y con él
+solo ve a su propia gente. Ver [Un token por proyecto](#un-token-por-proyecto).
 
 ### Migrar contraseñas viejas
 

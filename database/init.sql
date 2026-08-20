@@ -44,3 +44,23 @@ CREATE TABLE IF NOT EXISTS resets_password (
 
     FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
 );
+
+-- Aplicaciones que le pegan al padrón: el login central y el front de cada
+-- proyecto. Cada una tiene su token, para que el padrón sepa quién pregunta y
+-- le devuelva solo lo suyo (ver GET /usuarios).
+--
+-- `proyecto_id` NULL = ve el padrón entero. Es el login central, que tiene que
+-- ofrecer "elegí tu proyecto" antes de saber a cuál va la persona.
+--
+-- Del token se guarda el hash, no el token. Se dan de alta con
+-- POST /aplicaciones, con el token de la cátedra.
+CREATE TABLE IF NOT EXISTS aplicaciones (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL UNIQUE,
+    proyecto_id INT NULL,
+    token_hash CHAR(64) NOT NULL UNIQUE,
+    creada_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    revocada_en DATETIME NULL,
+
+    FOREIGN KEY (proyecto_id) REFERENCES proyectos(id)
+);

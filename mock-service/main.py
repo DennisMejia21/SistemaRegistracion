@@ -12,27 +12,36 @@ from pydantic import BaseModel
 
 @asynccontextmanager
 async def preparar(app: FastAPI):
-    """Crea la tabla de resets si falta, antes de atender el primer pedido.
+    """Crea las tablas que falten antes de atender el primer pedido.
 
     `database/init.sql` solo corre cuando el volumen de mysql esta vacio, asi
-    que en una base que ya venia andando esa tabla no existiria. Aca se crea si
-    hace falta y no pasa nada si ya esta.
+    que en una base que ya venia andando esas tablas no existirian. Aca se
+    crean si hace falta y no pasa nada si ya estan.
     """
-    asegurar_tabla_resets()
+    asegurar_tablas()
     yield
 
 
 app = FastAPI(title="Servicio de Registración", lifespan=preparar)
 
 
-# Token de las aplicaciones que leen el padrón (por ahora, el front de login).
-# Va en `Authorization: Bearer`. Sin esto, GET /usuarios queda abierto y
-# cualquiera que llegue al puerto se lleva todos los emails.
+# Token del login central, la unica aplicacion que ve el padron entero (lo
+# necesita: muestra "elegi tu proyecto" antes de saber a cual va la persona).
+# Va en `Authorization: Bearer`. Al arrancar se registra en `aplicaciones` con
+# este valor; cambiarlo aca cambia el token de esa fila.
+#
+# Los proyectos NO usan este: cada uno tiene el suyo, que se crea con
+# POST /aplicaciones y solo ve a su propia gente.
 API_TOKEN = os.getenv("API_TOKEN", "")
 
-# Token de la catedra, para emitir un reset de contraseña. Es OTRO token a
-# proposito: el de arriba lo tiene cada front, y si sirviera para esto
-# cualquier proyecto de la materia podria cambiarle la contraseña a cualquiera.
+# Como se llama esa fila en `aplicaciones`. Se busca por nombre para poder
+# actualizarle el token cuando cambia API_TOKEN.
+APP_DEL_LOGIN = "Login central"
+
+# Token de la catedra: emite resets de contraseña y da de alta aplicaciones. Es
+# OTRO token a proposito, y no esta en la tabla `aplicaciones`: los de ahi los
+# tienen los fronts, y si alguno sirviera para esto, cualquier proyecto de la
+# materia podria cambiarle la contraseña a cualquiera o emitirse tokens nuevos.
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 # Cuanto vive un token de reset. Corto porque viaja por fuera del sistema
@@ -70,6 +79,12 @@ class PedidoDeReset(BaseModel):
 class PasswordNueva(BaseModel):
     token: str
     password: str
+
+
+class AplicacionNueva(BaseModel):
+    nombre: str
+    # None = ve el padron entero. Es para el login central, no para un proyecto.
+    proyecto_id: int | None = None
 
 
 @contextmanager
@@ -123,13 +138,14 @@ def verificar(password: str, guardado: str) -> bool:
         return False
 
 
-def asegurar_tabla_resets() -> None:
-    """Tabla de los tokens de reset. Ver `database/init.sql`, que la crea igual.
+def asegurar_tablas() -> None:
+    """Tablas que no estan en el init.sql original. Ver `database/init.sql`.
 
-    Del token guardamos el hash, no el token: si alguien se lleva un dump de la
-    base, con los hashes no puede cambiarle la contraseña a nadie. Es SHA-256 y
-    no bcrypt porque el token lo generamos nosotros con 256 bits de azar: no hay
-    nada que adivinar a fuerza bruta, que es contra lo que sirve bcrypt.
+    De los tokens guardamos el hash, no el token: si alguien se lleva un dump de
+    la base, con los hashes no entra a ningun lado ni le cambia la contraseña a
+    nadie. Es SHA-256 y no bcrypt porque los generamos nosotros con 256 bits de
+    azar: no hay nada que adivinar a fuerza bruta, que es contra lo que sirve
+    bcrypt.
     """
     with base_de_datos() as cursor:
         cursor.execute(
@@ -144,6 +160,63 @@ def asegurar_tabla_resets() -> None:
                 FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
             )
             """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS aplicaciones (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                nombre VARCHAR(100) NOT NULL UNIQUE,
+                proyecto_id INT NULL,
+                token_hash CHAR(64) NOT NULL UNIQUE,
+                creada_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                revocada_en DATETIME NULL,
+
+                FOREIGN KEY (proyecto_id) REFERENCES proyectos(id)
+            )
+            """
+        )
+
+        asegurar_app_del_login(cursor)
+
+
+def asegurar_app_del_login(cursor) -> None:
+    """Registra el token de API_TOKEN como la aplicacion del login central.
+
+    Existe para no romper lo que ya andaba: hasta ahora el token vivia solo en
+    el entorno. Ahora los tokens viven en la tabla, y este se sincroniza desde
+    la variable, asi cambiarla en el `.env` sigue alcanzando.
+    """
+    if not API_TOKEN:
+        return
+
+    token_hash = hashear_token(API_TOKEN)
+
+    cursor.execute(
+        "SELECT id, token_hash FROM aplicaciones WHERE nombre = %s",
+        (APP_DEL_LOGIN,)
+    )
+
+    fila = cursor.fetchone()
+
+    if fila is None:
+        cursor.execute(
+            """
+            INSERT INTO aplicaciones
+            (nombre, proyecto_id, token_hash)
+            VALUES (%s, NULL, %s)
+            """,
+            (APP_DEL_LOGIN, token_hash)
+        )
+
+    elif fila["token_hash"] != token_hash:
+        cursor.execute(
+            """
+            UPDATE aplicaciones
+            SET token_hash = %s, revocada_en = NULL
+            WHERE id = %s
+            """,
+            (token_hash, fila["id"])
         )
 
 
@@ -165,13 +238,36 @@ def exigir_password_valida(password: str) -> None:
         )
 
 
-def exigir_token(authorization: str | None) -> None:
-    if not API_TOKEN:
-        # Error de configuracion del servicio, no del que pide.
-        raise HTTPException(status_code=500, detail="API_TOKEN no esta configurado")
+def aplicacion_del_token(cursor, authorization: str | None) -> dict:
+    """Devuelve la aplicacion dueña del `Authorization: Bearer`, o corta con 401.
 
-    if not authorization or not secrets.compare_digest(authorization, f"Bearer {API_TOKEN}"):
+    Antes habia un solo token, en el entorno, y valia para todo: con el, el
+    front de cualquier proyecto se llevaba el padron entero, incluida la gente
+    de los otros. Ahora cada proyecto tiene el suyo y el padron sabe QUIEN
+    pregunta, asi que puede devolverle solo lo suyo.
+
+    Se busca por el hash del token y no se compara nada a mano: el token son
+    256 bits de azar, no hay nada que adivinar probando de a poco.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token invalido")
+
+    cursor.execute(
+        """
+        SELECT id, nombre, proyecto_id
+        FROM aplicaciones
+        WHERE token_hash = %s
+        AND revocada_en IS NULL
+        """,
+        (hashear_token(authorization.removeprefix("Bearer ").strip()),)
+    )
+
+    aplicacion = cursor.fetchone()
+
+    if aplicacion is None:
+        raise HTTPException(status_code=401, detail="Token invalido")
+
+    return aplicacion
 
 
 def exigir_admin(authorization: str | None) -> None:
@@ -334,28 +430,58 @@ def registrar(datos: Registro):
 
 @app.get("/usuarios")
 def listar_usuarios(authorization: str | None = Header(default=None)):
-    """El padron completo. Pide `Authorization: Bearer <API_TOKEN>`.
+    """Los usuarios que le corresponden a la aplicacion que pregunta.
+
+    Pide `Authorization: Bearer <token de la aplicacion>`. Si ese token es el de
+    un proyecto, devuelve solo a los inscriptos en ESE proyecto, y de cada uno
+    solo ese proyecto: que alguien este ademas en Carpooling no es asunto de
+    Alquiler de Quintas. El unico que ve el padron entero es el login central,
+    porque tiene que ofrecer "elegi tu proyecto" antes de saber a cual va.
 
     Nunca devuelve `password`: para validar credenciales esta POST /login.
     """
-    exigir_token(authorization)
-
     with base_de_datos() as cursor:
-        cursor.execute("""
-            SELECT
-                u.id,
-                u.nombre,
-                u.apellido,
-                u.email,
-                p.id AS proyecto_id,
-                p.nombre AS proyecto
-            FROM usuarios u
-            LEFT JOIN usuario_proyecto up
-                ON u.id = up.usuario_id
-            LEFT JOIN proyectos p
-                ON p.id = up.proyecto_id
-            ORDER BY u.id, p.id
-        """)
+        aplicacion = aplicacion_del_token(cursor, authorization)
+
+        if aplicacion["proyecto_id"] is None:
+            cursor.execute("""
+                SELECT
+                    u.id,
+                    u.nombre,
+                    u.apellido,
+                    u.email,
+                    p.id AS proyecto_id,
+                    p.nombre AS proyecto
+                FROM usuarios u
+                LEFT JOIN usuario_proyecto up
+                    ON u.id = up.usuario_id
+                LEFT JOIN proyectos p
+                    ON p.id = up.proyecto_id
+                ORDER BY u.id, p.id
+            """)
+
+        else:
+            # JOIN y no LEFT JOIN: aca las filas sin proyecto sobran, porque la
+            # condicion para aparecer es justamente estar en este proyecto.
+            cursor.execute(
+                """
+                SELECT
+                    u.id,
+                    u.nombre,
+                    u.apellido,
+                    u.email,
+                    p.id AS proyecto_id,
+                    p.nombre AS proyecto
+                FROM usuarios u
+                JOIN usuario_proyecto up
+                    ON u.id = up.usuario_id
+                    AND up.proyecto_id = %s
+                JOIN proyectos p
+                    ON p.id = up.proyecto_id
+                ORDER BY u.id
+                """,
+                (aplicacion["proyecto_id"],)
+            )
 
         resultados = cursor.fetchall()
 
@@ -509,4 +635,118 @@ def cambiar_password(datos: PasswordNueva):
         return {
             "ok": True,
             "mensaje": "Contraseña actualizada"
+        }
+
+
+@app.post("/aplicaciones")
+def crear_aplicacion(datos: AplicacionNueva, authorization: str | None = Header(default=None)):
+    """Da de alta una aplicacion y le emite su token. Solo la catedra.
+
+    Una por proyecto: asi el padron sabe quien le pregunta y cada uno ve solo a
+    su gente. Si una filtra su token, se revoca esa sola y los demas siguen
+    andando; con el token unico de antes habia que cambiarlo en todos.
+
+    El token se ve UNA vez, aca. En la base queda solo su hash.
+    """
+    exigir_admin(authorization)
+
+    nombre = datos.nombre.strip()
+
+    if not nombre:
+        raise HTTPException(status_code=422, detail="La aplicacion necesita un nombre")
+
+    with base_de_datos() as cursor:
+        if datos.proyecto_id is not None:
+            cursor.execute("SELECT id FROM proyectos WHERE id = %s", (datos.proyecto_id,))
+
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Ese proyecto no existe")
+
+        cursor.execute("SELECT id FROM aplicaciones WHERE nombre = %s", (nombre,))
+
+        if cursor.fetchone():
+            raise HTTPException(status_code=409, detail="Ya hay una aplicacion con ese nombre")
+
+        token = secrets.token_urlsafe(32)
+
+        cursor.execute(
+            """
+            INSERT INTO aplicaciones
+            (nombre, proyecto_id, token_hash)
+            VALUES (%s, %s, %s)
+            """,
+            (
+                nombre,
+                datos.proyecto_id,
+                hashear_token(token)
+            )
+        )
+
+        return {
+            "id": cursor.lastrowid,
+            "nombre": nombre,
+            "proyecto_id": datos.proyecto_id,
+            "token": token,
+            "aviso": "Guardalo ahora: no se vuelve a mostrar"
+        }
+
+
+@app.get("/aplicaciones")
+def listar_aplicaciones(authorization: str | None = Header(default=None)):
+    """Que aplicaciones hay y que ve cada una. Nunca los tokens: no los tenemos."""
+    exigir_admin(authorization)
+
+    with base_de_datos() as cursor:
+        cursor.execute(
+            """
+            SELECT
+                a.id,
+                a.nombre,
+                a.proyecto_id,
+                p.nombre AS proyecto,
+                a.creada_en,
+                a.revocada_en
+            FROM aplicaciones a
+            LEFT JOIN proyectos p ON p.id = a.proyecto_id
+            ORDER BY a.id
+            """
+        )
+
+        return cursor.fetchall()
+
+
+@app.delete("/aplicaciones/{aplicacion_id}")
+def revocar_aplicacion(aplicacion_id: int, authorization: str | None = Header(default=None)):
+    """Deja de aceptar el token de esa aplicacion. No se borra la fila: queda el
+    registro de que existio y cuando se corto."""
+    exigir_admin(authorization)
+
+    with base_de_datos() as cursor:
+        cursor.execute(
+            "SELECT id, nombre, revocada_en FROM aplicaciones WHERE id = %s",
+            (aplicacion_id,)
+        )
+
+        aplicacion = cursor.fetchone()
+
+        if aplicacion is None:
+            raise HTTPException(status_code=404, detail="No existe esa aplicacion")
+
+        if aplicacion["nombre"] == APP_DEL_LOGIN:
+            # Revocarla dejaria al login sin entrar, y al reiniciar el servicio
+            # volveria igual desde API_TOKEN: se cambia ahi, no por aca.
+            raise HTTPException(
+                status_code=409,
+                detail="La aplicacion del login se maneja con API_TOKEN"
+            )
+
+        if aplicacion["revocada_en"] is None:
+            cursor.execute(
+                "UPDATE aplicaciones SET revocada_en = NOW() WHERE id = %s",
+                (aplicacion_id,)
+            )
+
+        return {
+            "ok": True,
+            "mensaje": f"La aplicacion {aplicacion['nombre']} ya no entra"
         }
