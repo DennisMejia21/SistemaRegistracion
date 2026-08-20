@@ -6,7 +6,10 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+# main.py es el servicio; migrar_passwords.py se corre a mano una sola vez
+# (`docker compose exec mock-service python migrar_passwords.py`), asi que tiene
+# que estar adentro de la imagen.
+COPY main.py migrar_passwords.py ./
 
 EXPOSE 8000
 

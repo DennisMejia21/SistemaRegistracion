@@ -102,8 +102,38 @@ dependa de cómo los escriban.
 
 ### Ejecutar
 
+Las contraseñas de la base, el token y los puertos salen de un `.env` que **no está en
+el repositorio**. Lo que se versiona es `.env.example`, con valores de mentira:
+
+```bash
+cp .env.example .env
+```
+
+Editalo (al menos `DB_PASSWORD`, `MYSQL_ROOT_PASSWORD` y `API_TOKEN`) y levantá:
+
 ```bash
 docker compose up --build
+```
+
+Sin `.env` el `up` corta con `required variable DB_PASSWORD is missing a value`. Es a
+propósito: así nadie levanta el padrón con la contraseña del ejemplo.
+
+| Variable | Para qué | Por defecto |
+|---|---|---|
+| `DB_NAME`, `DB_USER` | base y usuario que crea mysql | `registracion`, `registracion_user` |
+| `DB_PASSWORD` | contraseña de ese usuario, la misma de los dos lados | — (obligatoria) |
+| `MYSQL_ROOT_PASSWORD` | root de mysql, para phpMyAdmin y los dumps | — (obligatoria) |
+| `API_TOKEN` | token de `GET /usuarios` | — (obligatoria) |
+| `PUERTO_API`, `PUERTO_MYSQL`, `PUERTO_PHPMYADMIN` | puertos **de la máquina** | `8000`, `3307`, `8081` |
+| `BIND_HOST` | interfaz donde se publican | `127.0.0.1` (solo esta máquina) |
+
+`DB_HOST` y `DB_PORT` no están en el `.env` a propósito: son los de la red interna de
+compose (`mysql:3306`), no los de la máquina, y cambiarlos rompe el servicio.
+
+Un token nuevo:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
 API:
@@ -118,14 +148,24 @@ Documentación:
 http://localhost:8000/docs
 ```
 
-phpMyAdmin queda en `http://localhost:8081`.
+phpMyAdmin queda en `http://localhost:8081` (o el `PUERTO_PHPMYADMIN` que hayas puesto).
 
-El token de `GET /usuarios` sale de la variable `API_TOKEN`, que en el compose tiene
-`token-de-desarrollo` por defecto. Para cambiarlo:
+### El front que lo consume
+
+[login-pp2](https://github.com/Ficuu/login-pp2) es el front de login y alta. No tiene
+base de datos ni guarda contraseñas: hace `POST /login` acá y, con los proyectos que
+vuelven en esa respuesta, decide si la persona no entra (cero proyectos), entra derecho
+(uno) o elige en un selector (varios).
+
+Para probar los dos juntos, en el repo del front:
 
 ```bash
-API_TOKEN="el-que-quieras" docker compose up --build
+PADRON_URL=http://localhost:8000   # el PUERTO_API de acá
+PADRON_TOKEN=...                   # el mismo API_TOKEN de acá
+SESION_SECRETO=...                 # 32+ caracteres, propio del front
 ```
+
+y levantarlo en otro puerto, `npm run dev -- -p 3001`.
 
 ### Migrar contraseñas viejas
 
@@ -143,7 +183,7 @@ hace nada. También normaliza los emails a minúsculas.
 original, que es justamente el punto. Si querés poder volver, sacá un dump antes:
 
 ```bash
-docker compose exec mysql mysqldump -uroot -proot registracion > respaldo.sql
+docker compose exec mysql sh -c 'mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" registracion' > respaldo.sql
 ```
 
 Mientras una fila no esté migrada, esa persona no puede entrar: su contraseña guardada

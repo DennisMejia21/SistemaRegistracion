@@ -1,0 +1,10 @@
+# Las variables reales del servicio: contrasenas de la base y API_TOKEN.
+# Lo que se versiona es .env.example, con valores de mentira.
+.env
+
+__pycache__/
+*.pyc
+
+# Dumps de la base, por si alguien saca uno antes de migrar contrasenas.
+*.sql.bak
+respaldo.sql

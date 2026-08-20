@@ -3,45 +3,77 @@ services:
   mock-service:
     build: ./mock-service
     container_name: registracion_mock
+
+    # El puerto se elige en el .env: si el 8000 ya esta ocupado se cambia ahi,
+    # sin tocar este archivo. Por defecto escucha solo en 127.0.0.1, asi el
+    # padron no queda expuesto al resto de la red mientras se desarrolla.
     ports:
-      - "8000:8000"
+      - "${BIND_HOST:-127.0.0.1}:${PUERTO_API:-8000}:8000"
+
     environment:
+      # DB_HOST y DB_PORT son los de la red interna de compose, no los de la
+      # maquina: el servicio le pega a mysql por el nombre del contenedor.
       DB_HOST: mysql
       DB_PORT: 3306
-      DB_NAME: registracion
-      DB_USER: registracion_user
-      DB_PASSWORD: registracion_pass
+      DB_NAME: ${DB_NAME:-registracion}
+      DB_USER: ${DB_USER:-registracion_user}
+      DB_PASSWORD: ${DB_PASSWORD:?falta DB_PASSWORD, copia .env.example a .env}
+
       # Token que tienen que mandar las aplicaciones que leen el padron
-      # (GET /usuarios), en `Authorization: Bearer`. Cambialo antes de subirlo
-      # a cualquier lado que no sea tu maquina.
-      API_TOKEN: ${API_TOKEN:-token-de-desarrollo}
+      # (GET /usuarios), en `Authorization: Bearer`.
+      API_TOKEN: ${API_TOKEN:?falta API_TOKEN, copia .env.example a .env}
+
     depends_on:
-      - mysql
+      mysql:
+        condition: service_healthy
+
+    restart: unless-stopped
 
   mysql:
     image: mysql:8.0
     container_name: registracion_mysql
+
     environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: registracion
-      MYSQL_USER: registracion_user
-      MYSQL_PASSWORD: registracion_pass
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?falta MYSQL_ROOT_PASSWORD, copia .env.example a .env}
+      MYSQL_DATABASE: ${DB_NAME:-registracion}
+      MYSQL_USER: ${DB_USER:-registracion_user}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?falta DB_PASSWORD, copia .env.example a .env}
+
+    # 3307 afuera para no chocar con un MySQL instalado en la maquina.
     ports:
-      - "3307:3306"
+      - "${BIND_HOST:-127.0.0.1}:${PUERTO_MYSQL:-3307}:3306"
+
+    # Sin esto el mock-service arranca antes de que la base acepte conexiones y
+    # el primer pedido falla: `depends_on` solo espera a que el contenedor
+    # exista, no a que mysql este listo.
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
     volumes:
       - mysql_data:/var/lib/mysql
       - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
 
+    restart: unless-stopped
+
   phpmyadmin:
     image: phpmyadmin/phpmyadmin
     container_name: registracion_phpmyadmin
+
     ports:
-      - "8081:80"
+      - "${BIND_HOST:-127.0.0.1}:${PUERTO_PHPMYADMIN:-8081}:80"
+
     environment:
       PMA_HOST: mysql
       PMA_PORT: 3306
+
     depends_on:
       - mysql
+
+    restart: unless-stopped
 
 volumes:
   mysql_data:
