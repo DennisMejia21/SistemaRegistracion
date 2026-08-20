@@ -21,6 +21,8 @@ contraseñas: le preguntan a este servicio.
 * Evitar registros duplicados en un mismo proyecto.
 * Validar credenciales (login).
 * Resetear la contraseña de alguien que la perdió.
+* Mandar a cada persona a la plataforma de su proyecto, sin que esa plataforma
+  vea nunca su contraseña.
 * Consultar usuarios y los proyectos en los que están registrados.
 
 ### Endpoints
@@ -36,6 +38,9 @@ POST /password         canjea el token por una contraseña nueva
 POST /aplicaciones     da de alta una app y su token   [token de la cátedra]
 GET  /aplicaciones     qué apps hay y qué ve cada una  [token de la cátedra]
 DELETE /aplicaciones/{id}   revoca el token de una app [token de la cátedra]
+PUT  /proyectos/{id}/url    dónde vive ese proyecto   [token de la cátedra]
+POST /codigos          emite un código de ingreso    [token del login central]
+POST /codigos/canjear  código -> quién es la persona [token del proyecto]
 ```
 
 #### `POST /login`
@@ -141,6 +146,78 @@ API, se maneja desde el `.env`.
 
 `ADMIN_TOKEN` no está en esta tabla y no es el token de ninguna aplicación: si lo fuera,
 cualquier proyecto podría emitirse tokens nuevos o resetear contraseñas ajenas.
+### Contraseñas
+### Entrar a un proyecto
+
+Cada proyecto de la materia tiene su propia plataforma, y la persona entra **una vez**,
+en el login central. Después el login la manda a su proyecto con un código de un solo
+uso, y ese proyecto lo canjea acá para enterarse de quién es. **Ningún proyecto ve una
+contraseña ni guarda una.**
+
+```text
+1. La persona entra en el login central y elige su proyecto.
+
+2. El login pide el código:
+   POST /codigos  {"usuario_id": 1, "proyecto_id": 1}   [token del login]
+   -> {"codigo": "NCicTX...", "volver_a": "https://carpooling.../sesion", "segundos": 60}
+
+3. El navegador va a  https://carpooling.../sesion?codigo=NCicTX...
+
+4. El backend de Carpooling canjea:
+   POST /codigos/canjear  {"codigo": "NCicTX..."}       [token de Carpooling]
+   -> {"usuario": {"id": 1, "nombre": "Ema", "apellido": "Ortiz",
+                   "email": "ortiz@gmail.com"},
+       "proyecto": {"id": 1, "nombre": "Carpooling"}}
+
+5. Carpooling emite SU sesión con eso. Listo.
+```
+
+Antes de que ande, la cátedra tiene que decir dónde vive cada proyecto:
+
+```bash
+curl -X PUT localhost:8000/proyectos/1/url \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"url":"https://carpooling.../sesion"}'
+```
+
+Esa URL es **la que ve el navegador**, no el nombre del contenedor: el redirect lo hace
+el navegador de la persona, no el servidor.
+
+Lo que tiene que escribir cada equipo es el paso 4, y es esto:
+
+```js
+// GET /sesion?codigo=...
+const r = await fetch(`${process.env.PADRON_URL}/codigos/canjear`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json",
+             Authorization: `Bearer ${process.env.PADRON_TOKEN}` },
+  body: JSON.stringify({ codigo }),
+});
+
+if (!r.ok) return respuestaDeError();       // código inválido, vencido o ajeno
+
+const { usuario } = await r.json();         // ya está: es esta persona
+// y acá cada uno emite su propia sesión, como la tenga hecha
+```
+
+Por qué está armado así:
+
+* **El destino sale de `proyectos.url`, nunca del pedido.** Si el que pide el código
+  pudiera elegir a dónde mandarlo, se mandaría el código de otra persona a un sitio
+  propio y entraría como ella. Por eso la URL la fija la cátedra y no viaja en la query.
+* **Solo el login central emite códigos.** Emitir uno es afirmar "esta persona ya probó
+  quién es", y el único que valida contraseñas es el login. Si el front de Carpooling
+  pudiera emitirlos, se emitiría uno para cualquiera y entraría sin saber su contraseña.
+* **Un código solo lo canjea el proyecto al que va.** Con el token de Carpooling no se
+  canjea un código de Alquiler de Quintas.
+* **Un solo uso y 60 segundos** (`SEGUNDOS_DE_CODIGO`). Solo tiene que sobrevivir un
+  redirect; cuanto menos vive, menos importa que quede escrito en el historial del
+  navegador o en el log de algún servidor. Pedir uno nuevo invalida el anterior.
+* **Mismo error para todo**: inventado, vencido, usado o de otro proyecto responden 400
+  con `{"detail": "El codigo no sirve o ya vencio"}`.
+* **Sin URL no hay salto.** Si un proyecto todavía no tiene plataforma, `POST /codigos`
+  responde 409 y el login deja a la persona en su propia pantalla. Los proyectos se van
+  sumando de a uno, sin romper a los demás.
 
 ### Contraseñas
 
@@ -226,6 +303,7 @@ propósito: así nadie levanta el padrón con la contraseña del ejemplo.
 | `API_TOKEN` | token del **login central**, la app que ve todo el padrón | — (obligatoria) |
 | `ADMIN_TOKEN` | token de la cátedra: resets y alta de aplicaciones | — (obligatoria) |
 | `MINUTOS_DE_RESET` | cuánto vive un token de reset | `30` |
+| `SEGUNDOS_DE_CODIGO` | cuánto vive un código de ingreso a un proyecto | `60` |
 | `PUERTO_API`, `PUERTO_MYSQL`, `PUERTO_PHPMYADMIN` | puertos **de la máquina** | `8000`, `3307`, `8081` |
 | `BIND_HOST` | interfaz donde se publican | `127.0.0.1` (solo esta máquina) |
 

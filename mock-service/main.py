@@ -49,6 +49,11 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 # cuantas manos anduvo.
 MINUTOS_DE_RESET = int(os.getenv("MINUTOS_DE_RESET", "30"))
 
+# Cuanto vive un codigo de ingreso a un proyecto. Segundos, no minutos: el
+# codigo solo tiene que sobrevivir un redirect del navegador. Cuanto menos vive,
+# menos sirve si queda escrito en el historial o en el log de algun servidor.
+SEGUNDOS_DE_CODIGO = int(os.getenv("SEGUNDOS_DE_CODIGO", "60"))
+
 # bcrypt no mira mas alla de los 72 bytes de la contraseña. Es un limite del
 # algoritmo, no de la columna: `password` es VARCHAR(255) porque ahi entra el
 # hash (60 caracteres), no porque la contraseña pueda ser tan larga.
@@ -85,6 +90,19 @@ class AplicacionNueva(BaseModel):
     nombre: str
     # None = ve el padron entero. Es para el login central, no para un proyecto.
     proyecto_id: int | None = None
+
+
+class UrlDeProyecto(BaseModel):
+    url: str
+
+
+class PedidoDeCodigo(BaseModel):
+    usuario_id: int
+    proyecto_id: int
+
+
+class CanjeDeCodigo(BaseModel):
+    codigo: str
 
 
 @contextmanager
@@ -177,7 +195,43 @@ def asegurar_tablas() -> None:
             """
         )
 
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS codigos_login (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                usuario_id INT NOT NULL,
+                proyecto_id INT NOT NULL,
+                codigo_hash CHAR(64) NOT NULL UNIQUE,
+                vence_en DATETIME NOT NULL,
+                usado_en DATETIME NULL,
+
+                FOREIGN KEY (usuario_id) REFERENCES usuarios(id),
+                FOREIGN KEY (proyecto_id) REFERENCES proyectos(id)
+            )
+            """
+        )
+
+        asegurar_url_de_proyectos(cursor)
         asegurar_app_del_login(cursor)
+
+
+def asegurar_url_de_proyectos(cursor) -> None:
+    """Agrega `proyectos.url` si falta: donde vive cada proyecto.
+
+    mysql no tiene `ADD COLUMN IF NOT EXISTS`, asi que hay que preguntar antes.
+    """
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS hay
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+        AND table_name = 'proyectos'
+        AND column_name = 'url'
+        """
+    )
+
+    if cursor.fetchone()["hay"] == 0:
+        cursor.execute("ALTER TABLE proyectos ADD COLUMN url VARCHAR(255) NULL")
 
 
 def asegurar_app_del_login(cursor) -> None:
@@ -749,4 +803,210 @@ def revocar_aplicacion(aplicacion_id: int, authorization: str | None = Header(de
         return {
             "ok": True,
             "mensaje": f"La aplicacion {aplicacion['nombre']} ya no entra"
+        }
+
+
+@app.put("/proyectos/{proyecto_id}/url")
+def fijar_url_de_proyecto(
+    proyecto_id: int,
+    datos: UrlDeProyecto,
+    authorization: str | None = Header(default=None)
+):
+    """Donde tiene que aterrizar la persona cuando entra a este proyecto.
+
+    La fija la catedra y sale de aca cada vez que se emite un codigo. Que este
+    en la base y no en el pedido es el punto: si el que pide el codigo pudiera
+    elegir a donde mandarlo, cualquiera se manda el codigo de otro a un sitio
+    propio y entra como esa persona.
+    """
+    exigir_admin(authorization)
+
+    url = datos.url.strip()
+
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=422, detail="La URL tiene que empezar con http:// o https://")
+
+    with base_de_datos() as cursor:
+        cursor.execute("SELECT id, nombre FROM proyectos WHERE id = %s", (proyecto_id,))
+        proyecto = cursor.fetchone()
+
+        if proyecto is None:
+            raise HTTPException(status_code=404, detail="Ese proyecto no existe")
+
+        cursor.execute("UPDATE proyectos SET url = %s WHERE id = %s", (url, proyecto_id))
+
+        return {
+            "id": proyecto["id"],
+            "nombre": proyecto["nombre"],
+            "url": url
+        }
+
+
+@app.post("/codigos")
+def emitir_codigo(datos: PedidoDeCodigo, authorization: str | None = Header(default=None)):
+    """Emite un codigo de un solo uso para mandar a alguien a su proyecto.
+
+    Lo pide el login central, DESPUES de haber validado la contraseña: emitir un
+    codigo es decir "esta persona ya probo quien es". Por eso solo lo puede pedir
+    una aplicacion sin proyecto (el login), y no el front de un proyecto: si no,
+    Carpooling podria emitirse un codigo para cualquiera y entrar como esa
+    persona sin saber su contraseña.
+
+    Devuelve tambien `volver_a`, que sale de `proyectos.url`. El navegador va
+    ahi con `?codigo=...` y el backend de ese proyecto lo canjea.
+    """
+    with base_de_datos() as cursor:
+        aplicacion = aplicacion_del_token(cursor, authorization)
+
+        if aplicacion["proyecto_id"] is not None:
+            raise HTTPException(
+                status_code=403,
+                detail="Solo el login central puede emitir codigos"
+            )
+
+        cursor.execute("SELECT id FROM usuarios WHERE id = %s", (datos.usuario_id,))
+
+        if cursor.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Ese usuario no existe")
+
+        cursor.execute(
+            "SELECT id, nombre, url FROM proyectos WHERE id = %s",
+            (datos.proyecto_id,)
+        )
+
+        proyecto = cursor.fetchone()
+
+        if proyecto is None:
+            raise HTTPException(status_code=404, detail="Ese proyecto no existe")
+
+        cursor.execute(
+            """
+            SELECT usuario_id
+            FROM usuario_proyecto
+            WHERE usuario_id = %s
+            AND proyecto_id = %s
+            """,
+            (
+                datos.usuario_id,
+                datos.proyecto_id
+            )
+        )
+
+        if cursor.fetchone() is None:
+            # No es "no encontrado": la persona existe y el proyecto tambien,
+            # pero no esta anotada ahi, asi que no tiene por que entrar. Se
+            # pregunta antes que por la URL para no contar como esta configurado
+            # un proyecto al que esta persona no entra igual.
+            raise HTTPException(
+                status_code=403,
+                detail="Esa persona no esta en ese proyecto"
+            )
+
+        if not proyecto["url"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Ese proyecto todavia no tiene URL: falta PUT /proyectos/{id}/url"
+            )
+
+        # Los codigos anteriores que sigan vivos dejan de servir: si alguien
+        # vuelve al selector, el de la vuelta pasada no tiene que seguir andando.
+        cursor.execute(
+            """
+            UPDATE codigos_login
+            SET usado_en = NOW()
+            WHERE usuario_id = %s
+            AND proyecto_id = %s
+            AND usado_en IS NULL
+            """,
+            (
+                datos.usuario_id,
+                datos.proyecto_id
+            )
+        )
+
+        codigo = secrets.token_urlsafe(32)
+
+        cursor.execute(
+            """
+            INSERT INTO codigos_login
+            (usuario_id, proyecto_id, codigo_hash, vence_en)
+            VALUES (%s, %s, %s, DATE_ADD(NOW(), INTERVAL %s SECOND))
+            """,
+            (
+                datos.usuario_id,
+                datos.proyecto_id,
+                hashear_token(codigo),
+                SEGUNDOS_DE_CODIGO
+            )
+        )
+
+        return {
+            "codigo": codigo,
+            "volver_a": proyecto["url"],
+            "segundos": SEGUNDOS_DE_CODIGO
+        }
+
+
+@app.post("/codigos/canjear")
+def canjear_codigo(datos: CanjeDeCodigo, authorization: str | None = Header(default=None)):
+    """Cambia el codigo por quien es la persona. Lo llama el backend del proyecto.
+
+    Va con el token de ESE proyecto, y el codigo solo se canjea si fue emitido
+    para el: con el token de Carpooling no se canjea un codigo de Alquiler de
+    Quintas.
+
+    Mismo error para codigo inventado, vencido, ya usado y de otro proyecto: no
+    hay nada que averiguar probando.
+    """
+    with base_de_datos() as cursor:
+        aplicacion = aplicacion_del_token(cursor, authorization)
+
+        if aplicacion["proyecto_id"] is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Los codigos los canjea el proyecto al que van dirigidos"
+            )
+
+        cursor.execute(
+            """
+            SELECT id, usuario_id, proyecto_id
+            FROM codigos_login
+            WHERE codigo_hash = %s
+            AND proyecto_id = %s
+            AND usado_en IS NULL
+            AND vence_en > NOW()
+            """,
+            (
+                hashear_token(datos.codigo),
+                aplicacion["proyecto_id"]
+            )
+        )
+
+        codigo = cursor.fetchone()
+
+        if codigo is None:
+            raise HTTPException(status_code=400, detail="El codigo no sirve o ya vencio")
+
+        # Se marca usado en la misma transaccion que la lectura de la persona:
+        # dos pedidos con el mismo codigo no pueden entrar los dos.
+        cursor.execute(
+            "UPDATE codigos_login SET usado_en = NOW() WHERE id = %s",
+            (codigo["id"],)
+        )
+
+        cursor.execute(
+            "SELECT id, nombre, apellido, email FROM usuarios WHERE id = %s",
+            (codigo["usuario_id"],)
+        )
+
+        usuario = cursor.fetchone()
+
+        cursor.execute(
+            "SELECT id, nombre FROM proyectos WHERE id = %s",
+            (codigo["proyecto_id"],)
+        )
+
+        return {
+            "usuario": usuario,
+            "proyecto": cursor.fetchone()
         }

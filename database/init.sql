@@ -8,7 +8,12 @@ CREATE TABLE usuarios (
 
 CREATE TABLE proyectos (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    nombre VARCHAR(100) NOT NULL
+    nombre VARCHAR(100) NOT NULL,
+
+    -- Donde vive el front de ese proyecto. Es a donde se manda a la persona
+    -- cuando entra, y sale de aca y nunca del pedido: si el que pide el codigo
+    -- pudiera elegir el destino, se lo mandaria a un sitio propio.
+    url VARCHAR(255) NULL
 );
 
 CREATE TABLE usuario_proyecto (
@@ -62,5 +67,22 @@ CREATE TABLE IF NOT EXISTS aplicaciones (
     creada_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     revocada_en DATETIME NULL,
 
+    FOREIGN KEY (proyecto_id) REFERENCES proyectos(id)
+);
+
+-- Códigos de ingreso a un proyecto (POST /codigos).
+--
+-- Un solo uso y unos segundos de vida: solo tienen que sobrevivir el redirect
+-- del login al proyecto. El proyecto los canjea con su token y recibe quién es
+-- la persona, sin haber visto nunca su contraseña.
+CREATE TABLE IF NOT EXISTS codigos_login (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    usuario_id INT NOT NULL,
+    proyecto_id INT NOT NULL,
+    codigo_hash CHAR(64) NOT NULL UNIQUE,
+    vence_en DATETIME NOT NULL,
+    usado_en DATETIME NULL,
+
+    FOREIGN KEY (usuario_id) REFERENCES usuarios(id),
     FOREIGN KEY (proyecto_id) REFERENCES proyectos(id)
 );

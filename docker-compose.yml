@@ -19,14 +19,16 @@ services:
       DB_USER: ${DB_USER:-registracion_user}
       DB_PASSWORD: ${DB_PASSWORD:?falta DB_PASSWORD, copia .env.example a .env}
 
-      # Token que tienen que mandar las aplicaciones que leen el padron
-      # (GET /usuarios), en `Authorization: Bearer`.
+      # Token del login central, la unica aplicacion que ve el padron entero.
+      # Los fronts de los proyectos tienen el suyo, que se crea con
+      # POST /aplicaciones y vive en la base.
       API_TOKEN: ${API_TOKEN:?falta API_TOKEN, copia .env.example a .env}
 
-      # Token de la catedra, para emitir resets de contraseña. Tiene que ser
-      # distinto del de arriba: ese lo tiene cada front.
+      # Token de la catedra: resets de contraseña y alta de aplicaciones. Tiene
+      # que ser distinto del de arriba, si no cualquier front podria usarlo.
       ADMIN_TOKEN: ${ADMIN_TOKEN:?falta ADMIN_TOKEN, copia .env.example a .env}
       MINUTOS_DE_RESET: ${MINUTOS_DE_RESET:-30}
+      SEGUNDOS_DE_CODIGO: ${SEGUNDOS_DE_CODIGO:-60}
 
     depends_on:
       mysql:
