@@ -146,7 +146,7 @@ API, se maneja desde el `.env`.
 
 `ADMIN_TOKEN` no está en esta tabla y no es el token de ninguna aplicación: si lo fuera,
 cualquier proyecto podría emitirse tokens nuevos o resetear contraseñas ajenas.
-### Contraseñas
+
 ### Entrar a un proyecto
 
 Cada proyecto de la materia tiene su propia plataforma, y la persona entra **una vez**,
@@ -154,14 +154,23 @@ en el login central. Después el login la manda a su proyecto con un código de 
 uso, y ese proyecto lo canjea acá para enterarse de quién es. **Ningún proyecto ve una
 contraseña ni guarda una.**
 
+El circuito arranca en cualquiera de los dos lados:
+
+* **Desde el proyecto** (el caso normal): Carpooling tiene un botón "Ingresar" que manda
+  a `https://login.pp2/entrar?proyecto_id=1&state=algoAlAzar`. La persona se identifica
+  y vuelve. Si ya tenía sesión abierta en el login, vuelve sin que le pregunten nada.
+* **Desde el login**: entra al login central y elige su proyecto en el selector.
+
+De ahí en adelante es lo mismo:
+
 ```text
-1. La persona entra en el login central y elige su proyecto.
+1. La persona queda identificada y se sabe a qué proyecto va.
 
 2. El login pide el código:
    POST /codigos  {"usuario_id": 1, "proyecto_id": 1}   [token del login]
    -> {"codigo": "NCicTX...", "volver_a": "https://carpooling.../sesion", "segundos": 60}
 
-3. El navegador va a  https://carpooling.../sesion?codigo=NCicTX...
+3. El navegador va a  https://carpooling.../sesion?codigo=NCicTX...&state=...
 
 4. El backend de Carpooling canjea:
    POST /codigos/canjear  {"codigo": "NCicTX..."}       [token de Carpooling]
@@ -182,6 +191,10 @@ curl -X PUT localhost:8000/proyectos/1/url \
 
 Esa URL es **la que ve el navegador**, no el nombre del contenedor: el redirect lo hace
 el navegador de la persona, no el servidor.
+
+**Hay un ejemplo andando** en [`ejemplo-consumidor/`](ejemplo-consumidor): un proyecto de
+juguete, sin dependencias, con el botón "Ingresar", la vuelta y el canje. Se levanta con
+un `docker run` y sirve para copiar.
 
 Lo que tiene que escribir cada equipo es el paso 4, y es esto:
 
@@ -218,6 +231,9 @@ Por qué está armado así:
 * **Sin URL no hay salto.** Si un proyecto todavía no tiene plataforma, `POST /codigos`
   responde 409 y el login deja a la persona en su propia pantalla. Los proyectos se van
   sumando de a uno, sin romper a los demás.
+* **El `state` es del proyecto.** Lo manda él al empezar y le vuelve tal cual; ni el
+  login ni el padrón lo miran. Sirve para que el proyecto reconozca su propia ida y no
+  acepte una vuelta que nunca empezó.
 
 ### Contraseñas
 
